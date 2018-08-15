@@ -26,17 +26,44 @@ func getHref(t html.Token) (ok bool, href string) {
 	return
 }
 
+var freeThreads = 16
 var numStarted, numFinished, numErrors, numBytes int64 = 1, 0, 0, 0
 var foundUrls = make(map[string]bool)
+var chUrls = make(chan string, 10000)
+var chToCrawl = make(chan string, 10000)
+var chFinished = make(chan bool, 10000)
 
 // Extract all http** links from a given webpage
 func crawl(url string, ch chan string, chFinished chan bool) {
-	resp, err := http.Get(url)
+	//fmt.Println("\nCrawling:  " + url)
 
 	defer func() {
 		// Notify that we're done after this function
-		chFinished <- true
+
+		select {
+		case chFinished <- true:
+		default:
+			fmt.Println("chFinished would block")
+		}
 	}()
+
+	resp, err := http.Get(url)
+	if err != nil {
+		fmt.Println("error in get")
+		return
+	}
+
+	output, err := httputil.DumpResponse(resp, true)
+
+	if err != nil {
+		fmt.Println("error in dumpresponse")
+		return
+	}
+	if resp.Body == nil {
+		fmt.Println("error in body")
+		return
+	}
+	numBytes += int64(len(output))
 
 	if err != nil {
 		numErrors++
@@ -44,7 +71,7 @@ func crawl(url string, ch chan string, chFinished chan bool) {
 		fmt.Println("\nERROR: Failed to crawl \"" + url + "\"")
 		return
 	}
-	fmt.Println("content length", resp.ContentLength)
+	//fmt.Println("content length", resp.ContentLength)
 
 	b := resp.Body
 	defer b.Close() // close Body when the function returns
@@ -64,13 +91,13 @@ func crawl(url string, ch chan string, chFinished chan bool) {
 		switch {
 		case tt == html.ErrorToken:
 			// End of the document, we're done
-			dump, err := httputil.DumpResponse(resp, true)
-			if err != nil {
-				//log.Fatal(err)
-			}
+			//dump, err := httputil.DumpResponse(resp, true)
+			//if err != nil {
+			//log.Fatal(err)
+			//}
 
-			fmt.Println("response len:", len(dump))
-			numBytes += int64(len(dump))
+			//fmt.Println("response len:", string(dump))
+
 			return
 		case tt == html.StartTagToken:
 			t := z.Token()
@@ -90,14 +117,38 @@ func crawl(url string, ch chan string, chFinished chan bool) {
 			// Make sure the url begines in http**
 			hasProto := strings.Index(url, "http") == 0
 			if hasProto {
-				ch <- url
+
+				select {
+				case ch <- url:
+				default:
+					fmt.Println("ch would block")
+				}
 			}
 		}
 	}
 }
 func stats() {
+	var bytes [10]int64
+	var index = 0
+	var lastBytes int64 = 0
+
 	for {
-		fmt.Println("\n", numStarted, numFinished, len(foundUrls), numErrors, numBytes)
+		bytes[index] = numBytes - lastBytes
+		index++
+		if index == len(bytes) {
+			index = 0
+		}
+		lastBytes = numBytes
+		var avg int64 = 0
+		for i := range bytes {
+			avg += bytes[i]
+		}
+		avg = avg / 10
+		fmt.Println(" numStarted:", numStarted, "numFinished:", numFinished, "found:", len(foundUrls), "numErrors:", numErrors, numBytes, "KB/s", avg/1024)
+		fmt.Println(" chToCrawl:", len(chToCrawl), " chUrls:", len(chUrls), " chFinished:", len(chFinished))
+
+		//fmt.Println(index)
+		//fmt.Println(bytes)
 		time.Sleep(1 * time.Second)
 	}
 }
@@ -107,8 +158,6 @@ func main() {
 
 	go stats()
 	// Channels
-	chUrls := make(chan string)
-	chFinished := make(chan bool)
 
 	// Kick off the crawl process (concurrently)
 	for _, url := range seedUrls {
@@ -117,30 +166,47 @@ func main() {
 
 	// Subscribe to both channels
 	for {
-		time.Sleep(500 * time.Millisecond)
+		time.Sleep(1 * time.Millisecond)
 
 		select {
 		case url := <-chUrls:
 
 			ok := foundUrls[url]
 			if !ok {
-				fmt.Println("\nAdding", url)
-				numStarted++
-				go crawl(url, chUrls, chFinished)
 				foundUrls[url] = true
+				select {
+				case chToCrawl <- url:
+				default:
+					fmt.Println("chToCrawl would block")
+				}
+
 			} else {
-				fmt.Println("\nAllready Added", url)
+				//fmt.Println("\nAllready Added", url)
 			}
 		case <-chFinished:
 			numFinished++
-			fmt.Println("\nFINISHED!")
+			freeThreads++
+		default:
+			if freeThreads > 0 {
+				//fmt.Println("\nDefault")
+				select {
+				case url := <-chToCrawl:
+					go crawl(url, chUrls, chFinished)
+					numStarted++
+					freeThreads--
+				default:
+					//fmt.Println("\no activity")
+				}
+
+			}
+			//fmt.Println("\nFINISHED!")
 		}
 
 	}
 
 	// We're done! Print the results...
 
-	fmt.Println("\nFound", len(foundUrls), "unique urls:\n")
+	//fmt.Println("\nFound", len(foundUrls), "unique urls:\n")
 
 	for url, _ := range foundUrls {
 		fmt.Println(" - " + url)
